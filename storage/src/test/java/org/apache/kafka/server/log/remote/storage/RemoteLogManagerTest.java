@@ -2807,6 +2807,89 @@ public class RemoteLogManagerTest {
         }
     }
 
+    // ------------------------------------------------------------------------------------------------
+    // DINF-2144 — size-retention over-deletion when highestOffsetInRemoteStorage is unseeded (-1).
+    //
+    // On a freshly-elected/restarted leader, UnifiedLog.highestOffsetInRemoteStorage starts at -1 and is
+    // only ever seeded by RLMCopyTask.maybeUpdateCopiedOffset / RLMFollowerTask — NOT by RLMExpirationTask.
+    // While it is still -1, UnifiedLog.onlyLocalLogSegmentsSize() returns the WHOLE local log (its filter is
+    // `baseOffset >= highestOffsetInRemoteStorage()`, i.e. `>= -1`, which matches every local segment,
+    // including segments already copied to remote but not yet locally evicted). buildRetentionSizeData then
+    // computes totalSize = onlyLocalLogSegmentsSize + remoteLogSizeBytes, double-counting that overlap. For a
+    // topic at its retention.bytes cap this falsely breaches and expires the ENTIRE copied remote tier
+    // (logStartOffset jumps to highestCopiedRemoteOffset + 1), deleting in-retention data from both tiers.
+    //
+    // Both tests use IDENTICAL remote metadata and IDENTICAL retention.bytes; they differ ONLY in the value of
+    // onlyLocalLogSegmentsSize() — the field through which the bug manifests:
+    //   - seeded leader      -> onlyLocalLogSegmentsSize() excludes copied segments (0)  -> no breach
+    //   - fresh leader (-1)  -> onlyLocalLogSegmentsSize() returns the whole local log   -> false breach
+    // Still reproduces on trunk: buildRetentionSizeData's early-exit gate uses
+    // (onlyLocalLogSegmentsSize + fullCopyFinishedSegmentsSizeInBytes), so an inflated onlyLocalLogSegmentsSize
+    // both passes the gate and inflates the final totalSize.
+    // ------------------------------------------------------------------------------------------------
+
+    private void setUpAtCapSizeRetention(long onlyLocalLogSegmentsSize) throws RemoteStorageException {
+        long segmentSize = 1024L;
+        long retentionSize = 2 * segmentSize;        // 2048 = the true unique size; topic sits AT its cap
+
+        Map<String, Long> logProps = new HashMap<>();
+        logProps.put("retention.bytes", retentionSize);
+        logProps.put("retention.ms", -1L);           // size-retention only
+        when(mockLog.config()).thenReturn(new LogConfig(logProps));
+
+        List<EpochEntry> epochEntries = List.of(epochEntry0);
+        checkpoint.write(epochEntries);
+        LeaderEpochFileCache cache = new LeaderEpochFileCache(tp, checkpoint, scheduler);
+        when(mockLog.leaderEpochCache()).thenReturn(cache);
+        when(mockLog.topicPartition()).thenReturn(leaderTopicIdPartition.topicPartition());
+        when(mockLog.logEndOffset()).thenReturn(200L);
+        when(mockLog.size()).thenReturn(2 * segmentSize);            // local disk still holds both copied segments
+        when(mockLog.onlyLocalLogSegmentsSize()).thenReturn(onlyLocalLogSegmentsSize);
+
+        // 2 copied remote segments, 1024 bytes each: offsets [0..99] and [100..199].
+        // copyFinishedSegmentsSizeInBytes is derived from this list -> 2048 (== the real remote size).
+        List<RemoteLogSegmentMetadata> metadataList = listRemoteLogSegmentMetadata(
+                leaderTopicIdPartition, 2, 100, (int) segmentSize, epochEntries,
+                RemoteLogSegmentState.COPY_SEGMENT_FINISHED);
+        when(remoteLogMetadataManager.listRemoteLogSegments(leaderTopicIdPartition))
+                .thenAnswer(ans -> metadataList.iterator());
+        when(remoteLogMetadataManager.listRemoteLogSegments(leaderTopicIdPartition, 0))
+                .thenAnswer(ans -> metadataList.iterator());
+        when(remoteLogMetadataManager.updateRemoteLogSegmentMetadata(any(RemoteLogSegmentMetadataUpdate.class)))
+                .thenReturn(CompletableFuture.runAsync(() -> { }));
+    }
+
+    @Test
+    public void testSizeRetentionAtCapDeletesNothingWhenHighestRemoteOffsetSeeded()
+            throws RemoteStorageException, ExecutionException, InterruptedException {
+        // CONTROL: correctly-seeded leader. onlyLocalLogSegmentsSize() excludes the copied segments (== 0),
+        // so totalSize = 0 + 2048 = 2048 == retention.bytes -> nothing breaches. Passes today.
+        setUpAtCapSizeRetention(0L);
+        remoteLogManager.new RLMExpirationTask(leaderTopicIdPartition).cleanupExpiredRemoteLogSegments();
+
+        verify(remoteStorageManager, times(0)).deleteLogSegmentData(any());
+        assertEquals(0L, currentLogStartOffset.get());
+    }
+
+    @Test
+    public void testSizeRetentionDoesNotOverDeleteWhenHighestRemoteOffsetUnseeded()
+            throws RemoteStorageException, ExecutionException, InterruptedException {
+        // BUG: fresh leader, highestOffsetInRemoteStorage == -1, so onlyLocalLogSegmentsSize() returns the
+        // whole local log (the 2 copied-but-not-yet-evicted segments = 2048). That the real method returns the
+        // whole log in this state is proven, without stubbing, by
+        // UnifiedLogTest.testOnlyLocalLogSegmentsSizeCountsWholeLogWhenHighestRemoteOffsetUnseeded -- here we
+        // feed that value to show the consequence. totalSize then becomes
+        // 2048 (remote) + 2048 (local overlap) = 4096 > 2048 -> false breach -> BOTH segments expired,
+        // logStartOffset -> 200 (= highestCopiedRemoteOffset + 1). These assertions FAIL on trunk,
+        // demonstrating the data loss; they should pass once size-retention is guarded against an unseeded
+        // highestOffsetInRemoteStorage (or onlyLocalLogSegmentsSize is clamped by localLogStartOffset).
+        setUpAtCapSizeRetention(2 * 1024L);
+        remoteLogManager.new RLMExpirationTask(leaderTopicIdPartition).cleanupExpiredRemoteLogSegments();
+
+        verify(remoteStorageManager, times(0)).deleteLogSegmentData(any());
+        assertEquals(0L, currentLogStartOffset.get());
+    }
+
     @ParameterizedTest(name = "testDeletionOnOverlappingRetentionBreachedSegments retentionSize={0} retentionMs={1}")
     @CsvSource(value = {"0, -1", "-1, 0"})
     public void testDeletionOnOverlappingRetentionBreachedSegments(long retentionSize,
