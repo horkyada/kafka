@@ -467,6 +467,35 @@ public class UnifiedLogTest {
         assertTrue(deletedSegments > 0, "At least one segment should be deleted");
     }
 
+    // DINF-2144: documents the input that drives the tiered size-retention over-deletion. On a freshly-elected
+    // leader, highestOffsetInRemoteStorage is unseeded (-1) until RLMCopyTask/RLMFollowerTask seed it; while it
+    // is -1, the onlyLocalLogSegmentsSize() filter (baseOffset >= highestOffsetInRemoteStorage()) matches EVERY
+    // local segment -- including segments already copied to remote -- so it returns the whole local log. That
+    // value is what RemoteLogManager.buildRetentionSizeData then double-counts against the remote size.
+    @Test
+    public void testOnlyLocalLogSegmentsSizeCountsWholeLogWhenHighestRemoteOffsetUnseeded() throws IOException {
+        Supplier<MemoryRecords> records = () -> singletonRecords("test".getBytes());
+        int recordSize = records.get().sizeInBytes();
+        LogConfig config = new LogTestUtils.LogConfigBuilder()
+                .segmentBytes(recordSize * 2)          // a few records per segment -> multiple segments
+                .remoteLogStorageEnable(true)
+                .build();
+        log = createLog(logDir, config, true);
+        for (int i = 0; i < 10; i++) {
+            log.appendAsLeader(records.get(), 0);
+        }
+        assertTrue(log.numberOfSegments() > 1, "test needs multiple segments");
+
+        // Fresh leader: highestOffsetInRemoteStorage is unseeded, so onlyLocalLogSegmentsSize() returns the
+        // ENTIRE local log (filter baseOffset >= -1 matches all segments).
+        assertEquals(-1L, log.highestOffsetInRemoteStorage());
+        assertEquals(log.size(), log.onlyLocalLogSegmentsSize());
+
+        // Once seeded (as RLMCopyTask/RLMFollowerTask do), only the not-yet-copied tail is counted.
+        log.updateHighestOffsetInRemoteStorage(log.logEndOffset() - 1);
+        assertTrue(log.onlyLocalLogSegmentsSize() < log.size());
+    }
+
     @Test
     public void shouldDeleteLocalLogSegmentsWhenPolicyIsEmptyWithMsRetention() throws IOException {
         long oldTimestamp = mockTime.milliseconds() - 20000;
